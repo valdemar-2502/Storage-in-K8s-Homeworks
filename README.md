@@ -57,6 +57,33 @@
   - описание пода с контейнерами (`kubectl describe pods data-exchange`)
   - вывод команды чтения файла (`tail -f <имя общего файла>`)
 
+## Решение:
+Манифест: [containers-data-exchange.yaml](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/containers-data-exchange.yaml)
+
+Deployment состоит из двух контейнеров, которые монтируют один общий том `emptyDir` в каталог `/data`:
+
+- `busybox` каждые 5 секунд дописывает строку с датой в файл `/data/shared.log`;
+- `multitool` читает этот файл командой `tail -f`. Перед чтением он делает `touch`, чтобы `tail` не упал, если стартует раньше busybox.
+
+`emptyDir` существует, пока жив под, и общий для всех его контейнеров. При удалении пода данные теряются.
+
+```bash
+kubectl apply -f containers-data-exchange.yaml
+kubectl get pods -l app=data-exchange
+kubectl describe pods data-exchange
+kubectl exec -it deploy/data-exchange -c multitool -- tail -f /data/shared.log
+```
+
+Описание пода (два контейнера и общий том):
+
+![describe pod](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/01.png)
+![kubernetes](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/02.png)
+![kubernetes](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/03.png)
+
+Чтение файла контейнером multitool (новые строки каждые 5 секунд):
+
+![tail -f](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/04.png)
+
 ------
 
 ## Задание 2. PV, PVC
@@ -79,6 +106,81 @@
 - Описания:
   - объяснение наблюдаемого поведения ресурсов в двух последних шагах.
 
+## Решение:
+
+Манифест: [pv-pvc.yaml](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/pv-pvc.yaml) (PersistentVolume, PersistentVolumeClaim и Deployment).
+
+- PV `pv-local`: 1Gi, `hostPath: /data/pv-local` на узле, `persistentVolumeReclaimPolicy: Retain`.
+- PVC `pvc-local`: привязан к PV по имени (`volumeName`), `storageClassName: ""`, чтобы не использовался класс по умолчанию.
+- Deployment `data-exchange-pvc`: те же busybox и multitool, но общий том подключён через PVC.
+
+### Шаг 2. Создание PV, PVC и Deployment
+
+```bash
+kubectl apply -f pv-pvc.yaml
+kubectl get pv,pvc
+kubectl get pods -l app=data-exchange-pvc
+```
+
+PV и PVC в статусе `Bound`:
+
+![PV и PVC](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/05.png)
+
+Под с двумя контейнерами запущен:
+
+![pods](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/06.png)
+
+### Шаг 3. multitool читает данные, которые пишет busybox
+
+```bash
+kubectl exec -it deploy/data-exchange-pvc -c multitool -- tail -f /data/shared.log
+```
+
+![tail -f](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/07.png)
+
+### Шаг 4. Удаление Deployment и PVC
+
+```bash
+kubectl delete deployment data-exchange-pvc
+kubectl delete pvc pvc-local
+kubectl get pv
+kubectl describe pv pv-local
+```
+
+PV остался и перешёл в статус `Released`:
+
+![PV Released](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/08.png)
+
+![describe pv](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/09.png)
+
+**Объяснение.** У PV задана политика `persistentVolumeReclaimPolicy: Retain`: после удаления PVC кластер сохраняет и сам PV, и данные на нём.
+Статус `Released` означает, что заявка (PVC) удалена, но том ещё не готов к повторной привязке: в PV остаётся ссылка `claimRef` на бывший PVC.
+Автоматически том не станет снова `Available`. Чтобы использовать его заново, администратор должен вручную очистить `claimRef` или создать PV заново.
+
+### Шаг 5. Файл на диске узла и удаление PV
+
+```bash
+ls -l /data/pv-local
+tail -3 /data/pv-local/shared.log
+kubectl delete pv pv-local
+kubectl get pv
+ls -l /data/pv-local
+tail -3 /data/pv-local/shared.log
+```
+
+Файл сохранился на диске узла после удаления Deployment и PVC:
+
+![файл до удаления PV](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/10.png)
+
+PV удалён, а файл на диске остался:
+
+![PV удалён, файл на месте](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/11.png)
+![kubernetes](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/12.png)
+
+**Объяснение.** PV — это объект API, который лишь описывает, где находится хранилище. Удаление PV удаляет это описание, но не содержимое каталога.
+Политика `Retain` прямо запрещает Kubernetes удалять данные, а для `hostPath` у кластера нет механизма очистки каталога на узле.
+Данные удаляются только вручную (`sudo rm`). Если бы использовалась политика `Delete` с поддерживающим удаление, том и данные удалялись бы автоматически.
+
 ------
 
 ## Задание 3. StorageClass
@@ -96,6 +198,46 @@
   - `sc.yaml`
 - Скриншоты:
   - каждый шаг выполнения задания, начиная с шага 2
+
+## Решение:
+Манифест: [sc.yaml](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/sc.yaml) (StorageClass, PV, PVC и Deployment).
+
+- StorageClass `local-sc`: провижинер `kubernetes.io/no-provisioner` (тома автоматически не создаются), `volumeBindingMode: WaitForFirstConsumer`.
+- PV `pv-sc`: `storageClassName: local-sc`, `hostPath: /data/sc`. Он добавлен вручную: при `no-provisioner` PVC иначе не сможет привязаться.
+- PVC `pvc-sc`: запрашивает 1Gi из класса `local-sc`.
+- Deployment `data-exchange-sc`: busybox пишет в файл, multitool читает, том подключён через `pvc-sc`.
+
+Из-за `WaitForFirstConsumer` PVC остаётся в `Pending`, пока нет пода, который его использует, и привязывается к PV только после планирования пода.
+
+```bash
+kubectl apply -f sc.yaml
+kubectl get sc
+kubectl get pv,pvc
+kubectl get pods -l app=data-exchange-sc
+kubectl exec -it deploy/data-exchange-sc -c multitool -- tail -f /data/shared.log
+tail -3 /data/sc/shared.log
+```
+
+StorageClass создан:
+
+![StorageClass](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/13.png)
+
+PV и PVC в статусе `Bound`:
+
+![PV и PVC](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/14.png)
+
+Под запущен:
+
+![pods](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/15.png)
+
+multitool читает данные, которые пишет busybox:
+
+![tail -f](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/16.png)
+
+Файл на диске узла:
+
+![файл на узле](https://github.com/valdemar-2502/Storage-in-K8s-Homeworks/blob/main/screenshots/17.png)
+
 ---
 ## Шаблоны манифестов с учебными комментариями
 ### 1. Deployment (containers-data-exchange.yaml)
